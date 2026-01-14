@@ -17,8 +17,12 @@ DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
 
 
-def dump(path: Path, content: str):
-    path.write_text(content, encoding="utf-8")
+def dump_text(name: str, content: str):
+    (DEBUG_DIR / name).write_text(content, encoding="utf-8")
+
+
+def dump_json(name: str, obj):
+    (DEBUG_DIR / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def extract_first_email(text: str) -> str:
@@ -26,24 +30,19 @@ def extract_first_email(text: str) -> str:
     return m.group(0) if m else ""
 
 
-def is_json_like_datatable(obj) -> bool:
-    # Aceptamos varios formatos
+def is_json_with_rows(obj) -> bool:
     if isinstance(obj, dict):
         if "data" in obj and isinstance(obj["data"], list):
             return True
-        if "recordsTotal" in obj or "recordsFiltered" in obj:
-            return True
-        # otros nombres frecuentes
         for k in ["items", "results", "content"]:
             if k in obj and isinstance(obj[k], list):
                 return True
     if isinstance(obj, list):
-        return len(obj) > 0
+        return True
     return False
 
 
 def extract_rows(obj):
-    # Normaliza a lista de filas
     if isinstance(obj, dict):
         if isinstance(obj.get("data"), list):
             return obj["data"]
@@ -61,8 +60,28 @@ def replace_param(postdata: str, key: str, value: str) -> str:
     return re.sub(rf"({re.escape(key)}=)[^&]*", rf"\1{value}", postdata)
 
 
+def try_click_search(page):
+    # Muchas páginas aplican filtros solo al pulsar botón
+    candidates = [
+        "button:has-text('Buscar')",
+        "button:has-text('Filtrar')",
+        "input[type='submit']",
+        "button:has-text('Aplicar')",
+    ]
+    for sel in candidates:
+        btn = page.locator(sel).first
+        try:
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=2000)
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def main():
-    captured = []
+    captured_requests = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -74,14 +93,14 @@ def main():
             ),
             viewport={"width": 1280, "height": 720},
         )
+
         page = context.new_page()
         page.set_default_timeout(120000)
         page.set_default_navigation_timeout(120000)
 
         def on_request(req):
-            # Captura XHR/fetch y también POST
             if req.resource_type in ("xhr", "fetch") or req.method.lower() == "post":
-                captured.append(
+                captured_requests.append(
                     {
                         "url": req.url,
                         "method": req.method.upper(),
@@ -93,32 +112,30 @@ def main():
 
         page.on("request", on_request)
 
+        # 1) Cargar
         page.goto(URL, wait_until="domcontentloaded", timeout=120000)
 
-        # Filtrar Canarias
-        try:
-            page.get_by_label("Comunidad Autónoma").wait_for(timeout=120000)
-        except PlaywrightTimeoutError:
-            page.screenshot(path=str(DEBUG_DIR / "no_select.png"), full_page=True)
-            dump(DEBUG_DIR / "no_select.html", page.content())
-            raise RuntimeError("No aparece el select de Comunidad Autónoma en el runner.")
-
+        # 2) Filtrar
+        page.get_by_label("Comunidad Autónoma").wait_for(timeout=120000)
         page.get_by_label("Comunidad Autónoma").select_option(label="ISLAS CANARIAS")
+        page.wait_for_timeout(800)
 
-        # Esperar a que JS dispare peticiones
-        page.wait_for_timeout(2000)
+        # 3) Forzar búsqueda si existe botón
+        clicked = try_click_search(page)
+        dump_text("clicked_search.txt", f"clicked={clicked}")
+
+        # 4) Esperar que JS lance requests
+        page.wait_for_timeout(1500)
         t0 = time.time()
         while (time.time() - t0) < 20:
             page.wait_for_timeout(500)
 
+        # Debug “qué ve el runner”
         page.screenshot(path=str(DEBUG_DIR / "after_filter.png"), full_page=True)
-        dump(DEBUG_DIR / "after_filter.html", page.content())
-        dump(DEBUG_DIR / "requests.json", json.dumps(captured, ensure_ascii=False, indent=2))
+        dump_text("after_filter.html", page.content())
+        dump_json("requests.json", captured_requests)
 
-        if not captured:
-            raise RuntimeError("No se capturaron requests. Mira debug/after_filter.*")
-
-        # --- Elegir endpoint probando con page.request (MISMO CONTEXTO) ---
+        # 5) Autodetección de endpoint probando con page.request (mismo contexto)
         def score(req):
             u = req["url"].lower()
             s = 0
@@ -135,20 +152,18 @@ def main():
                 s += 3
             return s
 
-        candidates = sorted(captured, key=score, reverse=True)
+        candidates = sorted(captured_requests, key=score, reverse=True)
 
-        chosen = None
-        chosen_first_payload = None
         tested = []
+        chosen = None
+        chosen_payload = None
+        chosen_body_snippet = None
 
-        # Probar bastantes (a veces las “buenas” no están en top 25)
-        for req in candidates[:80]:
+        for req in candidates[:120]:
             try:
-                # Preparar fetch
                 fetch_kwargs = {
                     "method": req["method"],
                     "headers": {
-                        # copiamos headers relevantes, pero limpiamos algunos que dan problemas
                         "accept": req["headers"].get("accept", "application/json, text/plain, */*"),
                         "content-type": req["headers"].get("content-type", "application/x-www-form-urlencoded; charset=UTF-8"),
                         "x-requested-with": req["headers"].get("x-requested-with", "XMLHttpRequest"),
@@ -157,47 +172,46 @@ def main():
                     },
                     "timeout": 60000,
                 }
-
                 if req["method"] == "POST":
                     fetch_kwargs["data"] = req["post_data"]
 
                 resp = page.request.fetch(req["url"], **fetch_kwargs)
+                body = resp.text()
                 tested.append({"url": req["url"], "status": resp.status})
 
                 if resp.status != 200:
                     continue
 
-                ct = (resp.headers.get("content-type") or "").lower()
-                body = resp.text()
-
-                # intentar JSON aunque el content-type no diga application/json
+                # Intentar JSON aunque el content-type sea raro
                 try:
                     obj = json.loads(body)
                 except Exception:
                     continue
 
-                if is_json_like_datatable(obj):
+                if is_json_with_rows(obj):
                     chosen = req
-                    chosen_first_payload = obj
+                    chosen_payload = obj
+                    chosen_body_snippet = body[:1500]
                     break
 
             except Exception:
                 continue
 
-        dump(DEBUG_DIR / "tested_candidates.json", json.dumps(tested, ensure_ascii=False, indent=2))
+        dump_json("tested_candidates.json", tested)
 
         if not chosen:
+            # Guardar algunas pistas: primeras respuestas 200 (snippet)
+            dump_text("hint.txt", "No endpoint JSON detectado. Mira requests.json + tested_candidates.json + after_filter.png/html")
+            browser.close()
             raise RuntimeError(
-                "No pude identificar endpoint JSON incluso probando con page.request. "
-                "Revisa debug/requests.json y debug/tested_candidates.json."
+                "No pude identificar endpoint JSON. Abre el artifact debug-dumps y mira requests.json / tested_candidates.json."
             )
 
-        dump(DEBUG_DIR / "chosen_endpoint.txt", chosen["url"])
+        dump_text("chosen_endpoint.txt", chosen["url"])
+        dump_text("chosen_body_snippet.txt", chosen_body_snippet or "")
 
-        # --- Descargar todas las filas (paginación si DataTables) ---
-        all_rows = []
-        all_rows.extend(extract_rows(chosen_first_payload))
-
+        # 6) Obtener filas (paginación si DataTables)
+        all_rows = extract_rows(chosen_payload)
         post_template = chosen.get("post_data", "") or ""
         is_dt = any(k in post_template for k in ["start=", "length=", "draw="])
 
@@ -205,7 +219,6 @@ def main():
         start = 0
 
         if is_dt:
-            # Intentamos iterar hasta que no haya más filas
             while True:
                 start += length
                 postdata = post_template
@@ -243,10 +256,7 @@ def main():
 
                 time.sleep(0.15)
 
-        if not all_rows:
-            raise RuntimeError("Endpoint encontrado pero no devolvió filas útiles.")
-
-        # --- Parsear centros ---
+        # 7) Parsear centros
         centros = []
         for row in all_rows:
             codigo = ""
@@ -290,9 +300,10 @@ def main():
                     ficha_url = f"{BASE}/registroestatalentidadesformacion/centro/{codigo}"
                 centros.append((codigo, nombre, ficha_url))
 
-        dump(DEBUG_DIR / "centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:400]]))
+        dump_text("centros_count.txt", str(len(centros)))
+        dump_text("centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:400]]))
 
-        # --- Visitar ficha y extraer email (también con page.request) ---
+        # 8) Extraer email en fichas
         out = []
         for codigo, nombre, ficha_url in centros:
             email = ""
@@ -312,9 +323,9 @@ def main():
 
         browser.close()
 
-    # Guardar CSV
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+    # 9) CSV “Excel friendly”: ; y UTF-8 con BOM
+    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
         w.writerow(["codigo", "nombre", "email"])
         w.writerows(out)
 
