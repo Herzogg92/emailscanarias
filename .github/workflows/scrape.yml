@@ -1,4 +1,4 @@
-name: Scrape Canarias emails
+name: Scrape Canarias emails (API mode)
 
 on:
   workflow_dispatch:
@@ -17,11 +17,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright
-          playwright install --with-deps
+          pip install playwright requests
+          playwright install --with-deps chromium
 
       - name: Run scraper
         run: |
@@ -34,7 +34,7 @@ jobs:
           name: output-csv
           path: emails_centros_canarias.csv
 
-      - name: Upload debug artifacts (screenshots/html)
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
