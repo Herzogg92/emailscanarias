@@ -1,4 +1,4 @@
-name: Scrape Canarias emails (API mode)
+name: Scrape Canarias emails (auto-detect API)
 
 on:
   workflow_dispatch:
@@ -27,12 +27,13 @@ jobs:
         run: |
           python scrape_canarias_emails.py
 
-      - name: Upload CSV artifact
+      - name: Upload CSV artifact (if exists)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: output-csv
           path: emails_centros_canarias.csv
+          if-no-files-found: ignore
 
       - name: Upload debug artifacts
         if: always()
@@ -40,3 +41,4 @@ jobs:
         with:
           name: debug-dumps
           path: debug
+          if-no-files-found: ignore
