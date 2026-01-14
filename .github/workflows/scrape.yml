@@ -1,4 +1,4 @@
-name: Scrape Canarias emails (Playwright request context)
+name: Scrape Canarias emails
 
 on:
   workflow_dispatch:
