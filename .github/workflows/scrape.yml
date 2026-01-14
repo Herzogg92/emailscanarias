@@ -1,13 +1,12 @@
 name: Scrape Canarias emails
 
 on:
-  workflow_dispatch:  # lo ejecutas cuando quieras (botón en GitHub)
-  # schedule:
-  #   - cron: "0 6 * * 1"  # cada lunes 06:00 (opcional)
+  workflow_dispatch:
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -18,8 +17,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Playwright
         run: |
+          pip install --upgrade pip
           pip install playwright
           playwright install --with-deps
 
@@ -28,7 +28,15 @@ jobs:
           python scrape_canarias_emails.py
 
       - name: Upload CSV artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emails-centros-canarias
+          name: output-csv
           path: emails_centros_canarias.csv
+
+      - name: Upload debug artifacts (screenshots/html)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-dumps
+          path: debug
