@@ -1,13 +1,14 @@
 name: Scrape Canarias emails
 
 on:
-  workflow_dispatch:  # lo ejecutas cuando quieras (botón en GitHub)
+  workflow_dispatch:
   # schedule:
-  #   - cron: "0 6 * * 1"  # cada lunes 06:00 (opcional)
+  #   - cron: "0 6 * * 1"  # (opcional) cada lunes 06:00 UTC
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -18,8 +19,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Playwright
         run: |
+          pip install --upgrade pip
           pip install playwright
           playwright install --with-deps
 
