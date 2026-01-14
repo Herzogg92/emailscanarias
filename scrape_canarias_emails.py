@@ -27,14 +27,16 @@ def extract_first_email(text: str) -> str:
     return m.group(0) if m else ""
 
 
+def looks_like_datatables_json(obj) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    # DataTables típico
+    return ("data" in obj and isinstance(obj["data"], list)) or ("recordsTotal" in obj) or ("recordsFiltered" in obj)
+
+
 def main():
-    # 1) Abrimos la página SOLO para capturar:
-    #    - URL del endpoint XHR del listado
-    #    - headers/cookies necesarios
-    endpoint_url = None
-    captured_request = None
-    captured_headers = None
-    captured_postdata = None
+    captured = []  # lista de dicts con request info
+    cookies = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -44,114 +46,194 @@ def main():
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
+            viewport={"width": 1280, "height": 720},
         )
         page = context.new_page()
         page.set_default_timeout(120000)
         page.set_default_navigation_timeout(120000)
 
-        # Listener para detectar la llamada XHR que trae los datos del listado
         def on_request(req):
-            nonlocal endpoint_url, captured_request, captured_headers, captured_postdata
-            if req.method.lower() in ("post", "get"):
-                u = req.url
-                # heurística: DataTables suele pedir JSON con draw/start/length
-                # y muchas veces la ruta contiene buscarPublico o datatable o entidades
-                if "registroestatalentidadesformacion" in u and ("buscar" in u or "datatable" in u or "publico" in u):
-                    post = req.post_data or ""
-                    if ("draw=" in post) or ("start=" in post) or ("length=" in post):
-                        endpoint_url = u
-                        captured_request = req
-                        captured_headers = req.headers
-                        captured_postdata = post
+            # capturamos XHR/fetch + también POST (aunque venga como document)
+            rtype = req.resource_type
+            if rtype in ("xhr", "fetch") or req.method.lower() == "post":
+                captured.append(
+                    {
+                        "url": req.url,
+                        "method": req.method,
+                        "resource_type": rtype,
+                        "headers": dict(req.headers),
+                        "post_data": req.post_data or "",
+                    }
+                )
 
         page.on("request", on_request)
 
         page.goto(URL, wait_until="domcontentloaded", timeout=120000)
-        # Aplicamos el filtro para forzar la llamada XHR
-        page.get_by_label("Comunidad Autónoma").wait_for(timeout=120000)
+
+        # Esperar el filtro y aplicarlo
+        try:
+            page.get_by_label("Comunidad Autónoma").wait_for(timeout=120000)
+        except PlaywrightTimeoutError:
+            page.screenshot(path=str(DEBUG_DIR / "no_select.png"), full_page=True)
+            dump(DEBUG_DIR / "no_select.html", page.content())
+            raise RuntimeError("No aparece el select de Comunidad Autónoma en el runner.")
+
         page.get_by_label("Comunidad Autónoma").select_option(label="ISLAS CANARIAS")
 
-        # Esperamos a que se dispare la XHR
+        # Esperar un rato a que JS dispare peticiones
+        page.wait_for_timeout(2000)
         t0 = time.time()
-        while endpoint_url is None and (time.time() - t0) < 30:
-            page.wait_for_timeout(250)
+        while (time.time() - t0) < 25:
+            page.wait_for_timeout(500)
 
-        # Guardamos debug por si no encontramos endpoint
-        dump(DEBUG_DIR / "page_url.txt", page.url)
-        dump(DEBUG_DIR / "endpoint_detected.txt", str(endpoint_url))
+        # Guardar evidencias
+        page.screenshot(path=str(DEBUG_DIR / "after_filter.png"), full_page=True)
+        dump(DEBUG_DIR / "after_filter.html", page.content())
+        dump(DEBUG_DIR / "requests.json", json.dumps(captured, ensure_ascii=False, indent=2))
 
-        # cookies de la sesión para requests
         cookies = context.cookies()
         browser.close()
 
-    if not endpoint_url:
-        raise RuntimeError(
-            "No pude detectar el endpoint XHR del listado. Revisa debug/endpoint_detected.txt "
-            "y considera ejecutar local para ver si cambia."
-        )
+    # Si no hubo requests, no hay nada que hacer: el runner no está ejecutando el JS esperado
+    if not captured:
+        raise RuntimeError("No se capturó ninguna request XHR/fetch/POST tras filtrar. Revisa debug/after_filter.*")
 
-    # 2) Usamos requests para paginar por API (mucho más estable que el DOM)
+    # 2) Probar candidatos: buscamos requests que parezcan devolver JSON tipo DataTables
     sess = requests.Session()
-
-    # cargar cookies de Playwright en requests
     for c in cookies:
         sess.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
 
-    # headers base
-    headers = {
-        "User-Agent": captured_headers.get("user-agent", "Mozilla/5.0"),
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": captured_headers.get("content-type", "application/x-www-form-urlencoded; charset=UTF-8"),
-        "Origin": BASE,
-        "Referer": URL,
-        "X-Requested-With": "XMLHttpRequest",
-    }
+    best = None  # guardará (req_dict, parsed_json)
+    tested = []
 
-    # DataTables: vamos a iterar start=0, length=50 (o lo que acepte)
-    # Partimos del postdata capturado y solo cambiamos start/length.
+    # prioriza urls del mismo host y que contengan palabras típicas
+    def score(req):
+        u = req["url"]
+        s = 0
+        if "registrosfp.educacion.gob.es" in u:
+            s += 3
+        if "registroestatalentidadesformacion" in u:
+            s += 2
+        if any(k in u.lower() for k in ["buscar", "publico", "datatable", "list", "centro"]):
+            s += 2
+        if req["method"].upper() == "POST":
+            s += 1
+        if ("draw=" in (req["post_data"] or "")) or ("start=" in (req["post_data"] or "")) or ("length=" in (req["post_data"] or "")):
+            s += 3
+        return s
+
+    candidates = sorted(captured, key=score, reverse=True)
+
+    for req in candidates[:25]:  # probamos top 25
+        try:
+            headers = {
+                "User-Agent": req["headers"].get("user-agent", "Mozilla/5.0"),
+                "Accept": "application/json, text/plain, */*",
+                "Referer": URL,
+                "Origin": BASE,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            if req["method"].upper() == "POST":
+                ct = req["headers"].get("content-type", "application/x-www-form-urlencoded; charset=UTF-8")
+                headers["Content-Type"] = ct
+                resp = sess.post(req["url"], headers=headers, data=req["post_data"], timeout=60)
+            else:
+                resp = sess.get(req["url"], headers=headers, timeout=60)
+
+            tested.append({"url": req["url"], "status": resp.status_code})
+            if resp.status_code != 200:
+                continue
+
+            # ¿JSON?
+            try:
+                obj = resp.json()
+            except Exception:
+                continue
+
+            if looks_like_datatables_json(obj):
+                best = (req, obj)
+                break
+        except Exception:
+            continue
+
+    dump(DEBUG_DIR / "tested_candidates.json", json.dumps(tested, ensure_ascii=False, indent=2))
+
+    if not best:
+        raise RuntimeError(
+            "No pude identificar el endpoint JSON. Revisa debug/requests.json y debug/tested_candidates.json "
+            "(ahí verás qué URLs se llamaron)."
+        )
+
+    endpoint_req, first_payload = best
+    endpoint_url = endpoint_req["url"]
+    postdata_template = endpoint_req["post_data"] or ""
+    dump(DEBUG_DIR / "chosen_endpoint.txt", endpoint_url)
+
+    # 3) Paginación DataTables (si aplica)
     def replace_param(postdata: str, key: str, value: str) -> str:
-        # reemplaza key=... en x-www-form-urlencoded
         if f"{key}=" not in postdata:
-            # si no existe, lo añadimos
-            return postdata + f"&{key}={value}"
+            return postdata + ("" if postdata.endswith("&") or postdata == "" else "&") + f"{key}={value}"
         return re.sub(rf"({re.escape(key)}=)[^&]*", rf"\1{value}", postdata)
 
+    all_rows = []
     length = 50
     start = 0
-    all_rows = []
 
-    while True:
-        postdata = captured_postdata or ""
-        postdata = replace_param(postdata, "start", str(start))
-        postdata = replace_param(postdata, "length", str(length))
+    # Si no es DataTables clásico, igual first_payload trae todos. Lo intentamos de forma segura:
+    def get_rows(payload):
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return payload["data"]
+        return []
 
-        r = sess.post(endpoint_url, headers=headers, data=postdata, timeout=60)
-        r.raise_for_status()
+    rows0 = get_rows(first_payload)
+    all_rows.extend(rows0)
 
-        try:
-            payload = r.json()
-        except json.JSONDecodeError:
-            dump(DEBUG_DIR / f"bad_json_start_{start}.txt", r.text[:5000])
-            raise RuntimeError("El endpoint no devolvió JSON. Mira debug/bad_json_*")
+    # Si hay pinta DataTables, iteramos
+    # Condición: existe postdata con start/length o draw
+    is_dt = ("start=" in postdata_template) or ("length=" in postdata_template) or ("draw=" in postdata_template)
 
-        # DataTables típicamente devuelve: {"data":[...], "recordsTotal":..., "recordsFiltered":...}
-        rows = payload.get("data", [])
-        if not rows:
-            break
+    if is_dt:
+        # ya añadimos la primera página; seguimos
+        while True:
+            start += length
+            postdata = postdata_template
+            postdata = replace_param(postdata, "start", str(start))
+            postdata = replace_param(postdata, "length", str(length))
 
-        all_rows.extend(rows)
+            headers = {
+                "User-Agent": endpoint_req["headers"].get("user-agent", "Mozilla/5.0"),
+                "Accept": "application/json, text/plain, */*",
+                "Referer": URL,
+                "Origin": BASE,
+                "X-Requested-With": "XMLHttpRequest",
+                "Content-Type": endpoint_req["headers"].get("content-type", "application/x-www-form-urlencoded; charset=UTF-8"),
+            }
 
-        # si ya no hay más
-        if len(rows) < length:
-            break
+            resp = sess.post(endpoint_url, headers=headers, data=postdata, timeout=60)
+            if resp.status_code != 200:
+                break
 
-        start += length
-        time.sleep(0.2)
+            try:
+                payload = resp.json()
+            except Exception:
+                break
 
-    # 3) Parseo de filas: intentamos extraer código/nombre/url ficha desde "data"
-    # Como no conocemos exacto el formato, lo hacemos tolerante:
-    # - Si cada fila es lista: [codigo, nombre, ... , acciones_html]
-    # - Si es dict: buscamos keys parecidas
+            rows = get_rows(payload)
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+
+            if len(rows) < length:
+                break
+
+            time.sleep(0.2)
+
+    if not all_rows:
+        raise RuntimeError("El endpoint detectado devolvió JSON pero sin filas en 'data'.")
+
+    # 4) Parseo tolerante (list o dict) y construir ficha_url
     centros = []
     for row in all_rows:
         codigo = ""
@@ -159,22 +241,21 @@ def main():
         ficha_url = ""
 
         if isinstance(row, list) and len(row) >= 2:
-            codigo = re.sub(r"\s+", " ", str(row[0])).strip()
-            nombre = re.sub(r"\s+", " ", str(row[1])).strip()
+            raw0 = str(row[0])
+            raw1 = str(row[1])
+            codigo = re.sub(r"<[^>]+>", " ", raw0).strip()
+            nombre = re.sub(r"<[^>]+>", " ", raw1).strip()
 
-            # a veces el código viene con HTML <a href="...">
-            href = re.search(r'href="([^"]+)"', str(row[0]))
+            href = re.search(r'href="([^"]+)"', raw0)
             if href:
                 ficha_url = urljoin(BASE, href.group(1))
 
-            # o el lápiz está en la última columna con href
             if not ficha_url and len(row) >= 3:
                 href2 = re.search(r'href="([^"]+)"', str(row[-1]))
                 if href2:
                     ficha_url = urljoin(BASE, href2.group(1))
 
         elif isinstance(row, dict):
-            # posibles claves
             for k in ["codigo", "codigoCentro", "codCentro", "code"]:
                 if k in row:
                     codigo = str(row[k]).strip()
@@ -183,35 +264,35 @@ def main():
                 if k in row:
                     nombre = str(row[k]).strip()
                     break
-            # posibles URL
             for k in ["url", "detalle", "detailUrl", "fichaUrl"]:
                 if k in row:
                     ficha_url = urljoin(BASE, str(row[k]))
                     break
+
+        codigo = re.sub(r"\s+", " ", codigo).strip()
+        nombre = re.sub(r"\s+", " ", nombre).strip()
 
         if codigo and nombre:
             if not ficha_url and codigo.isdigit():
                 ficha_url = f"{BASE}/registroestatalentidadesformacion/centro/{codigo}"
             centros.append((codigo, nombre, ficha_url))
 
-    dump(DEBUG_DIR / "centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:200]]))
+    dump(DEBUG_DIR / "centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:300]]))
 
-    # 4) Visitar cada ficha (requests) y extraer email por regex
+    # 5) Visitar fichas y extraer email
     out = []
     for codigo, nombre, ficha_url in centros:
         email = ""
         if ficha_url:
             try:
-                rr = sess.get(ficha_url, headers={"User-Agent": headers["User-Agent"], "Referer": URL}, timeout=60)
-                rr.raise_for_status()
-                email = extract_first_email(rr.text)
+                rr = sess.get(ficha_url, headers={"User-Agent": "Mozilla/5.0", "Referer": URL}, timeout=60)
+                if rr.status_code == 200:
+                    email = extract_first_email(rr.text)
             except Exception:
                 email = ""
         out.append([codigo, nombre, email])
-
         time.sleep(0.15)
 
-    # 5) Guardar CSV
     with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["codigo", "nombre", "email"])
