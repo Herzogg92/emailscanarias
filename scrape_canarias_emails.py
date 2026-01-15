@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 URL = "https://registrosfp.educacion.gob.es/registroestatalentidadesformacion/buscarPublico"
 BASE = "https://registrosfp.educacion.gob.es"
@@ -21,9 +21,9 @@ OBFUSCATED_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Ajusta si quieres más/menos “agresivo”
-CONCURRENCY = 6          # paralelismo de fichas
-DETAIL_TIMEOUT_MS = 25000
+# Más concurrencia = más rápido (si el sitio no bloquea). 6 suele ir bien en Actions.
+CONCURRENCY = 6
+DETAIL_TIMEOUT_MS = 35000
 LIST_TIMEOUT_MS = 120000
 
 
@@ -80,8 +80,8 @@ async def try_click_search(page):
         loc = page.locator(sel).first
         try:
             if await loc.count() > 0 and await loc.is_visible():
-                await loc.click(timeout=2000)
-                await page.wait_for_timeout(800)
+                await loc.click(timeout=3000)
+                await page.wait_for_timeout(1000)
                 return True
         except Exception:
             continue
@@ -90,11 +90,12 @@ async def try_click_search(page):
 
 async def detect_list_endpoint_and_template(page):
     """
-    Detecta endpoint + post_data + headers de la request que devuelve JSON con 'data'.
+    Detecta endpoint + post_data + headers que devuelva JSON con filas.
     """
     captured = []
 
     async def on_request(req):
+        # ✅ FIX: post_data es PROPIEDAD, no función async
         if req.resource_type in ("xhr", "fetch") or req.method.lower() == "post":
             captured.append(
                 {
@@ -102,7 +103,7 @@ async def detect_list_endpoint_and_template(page):
                     "method": req.method.upper(),
                     "resource_type": req.resource_type,
                     "headers": dict(req.headers),
-                    "post_data": (await req.post_data()) or "",
+                    "post_data": req.post_data or "",
                 }
             )
 
@@ -110,24 +111,22 @@ async def detect_list_endpoint_and_template(page):
 
     await page.goto(URL, wait_until="domcontentloaded", timeout=LIST_TIMEOUT_MS)
 
-    # Filtrar Canarias
     await page.get_by_label("Comunidad Autónoma").wait_for(timeout=LIST_TIMEOUT_MS)
     await page.get_by_label("Comunidad Autónoma").select_option(label="ISLAS CANARIAS")
     await page.wait_for_timeout(600)
     clicked = await try_click_search(page)
     dump_text("clicked_search.txt", f"clicked={clicked}")
 
-    # Esperar a que lance requests
+    # esperar a que lance requests
     await page.wait_for_timeout(1500)
     t0 = time.time()
-    while time.time() - t0 < 15:
+    while time.time() - t0 < 18:
         await page.wait_for_timeout(500)
 
     await page.screenshot(path=str(DEBUG_DIR / "after_filter.png"), full_page=True)
     dump_text("after_filter.html", await page.content())
     dump_json("requests.json", captured)
 
-    # Scoring
     def score(req):
         u = req["url"].lower()
         s = 0
@@ -147,7 +146,8 @@ async def detect_list_endpoint_and_template(page):
     candidates = sorted(captured, key=score, reverse=True)
     tested = []
 
-    for req in candidates[:200]:
+    # probamos muchos candidatos
+    for req in candidates[:250]:
         try:
             headers = {
                 "accept": req["headers"].get("accept", "application/json, text/plain, */*"),
@@ -176,7 +176,7 @@ async def detect_list_endpoint_and_template(page):
             if is_dt_payload(obj) or len(rows_from_payload(obj)) > 0:
                 dump_json("tested_candidates.json", tested)
                 dump_text("chosen_endpoint.txt", req["url"])
-                dump_text("chosen_body_snippet.txt", body[:2000])
+                dump_text("chosen_body_snippet.txt", body[:2500])
                 return req, obj
 
         except Exception:
@@ -189,10 +189,9 @@ async def detect_list_endpoint_and_template(page):
 async def fetch_all_centers(page, req_template, first_payload):
     """
     Pagina hasta el final usando recordsFiltered/recordsTotal.
-    Si el servidor ignora length, se adapta al tamaño real que devuelva.
+    Si el backend ignora length y siempre devuelve 10, adaptamos el avance.
     """
     url = req_template["url"]
-    method = req_template["method"]
     headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": req_template["headers"].get("content-type", "application/x-www-form-urlencoded; charset=UTF-8"),
@@ -204,18 +203,17 @@ async def fetch_all_centers(page, req_template, first_payload):
 
     all_rows = rows_from_payload(first_payload)
 
-    # Determinar total si es DataTables
     total = None
     if isinstance(first_payload, dict):
         total = first_payload.get("recordsFiltered") or first_payload.get("recordsTotal")
 
-    # Longitud real que devuelve el server (muchas veces 10)
+    # tamaño real devuelto (siempre 10 en tu caso actual)
     page_size_real = max(1, len(rows_from_payload(first_payload)))
 
-    # Intento de pedir mucho (si el server lo ignora, no pasa nada)
+    # pedimos mucho, aunque nos devuelva 10
     requested_length = 500
 
-    # draw si existe
+    # draw (si existe)
     draw = None
     m = re.search(r"(?:^|&)draw=([^&]+)", post_template)
     if m:
@@ -224,29 +222,24 @@ async def fetch_all_centers(page, req_template, first_payload):
         except Exception:
             draw = None
 
-    start = 0
-
-    # Si no hay plantilla DataTables, devolvemos lo que tengamos
-    is_dt = any(k in post_template for k in ("start=", "length=", "draw=")) and method == "POST"
+    is_dt = all(k in post_template for k in ("start=", "length=")) and req_template["method"] == "POST"
     if not is_dt:
         return all_rows
 
-    # Loop hasta completar total o hasta que no haya más filas nuevas
-    seen_fingerprints = set()
+    start = 0
+    seen_hashes = set()
+
     def fingerprint(rows):
-        # huella ligera para evitar bucles
         return hash("|".join(str(r[0]) if isinstance(r, list) and r else str(r) for r in rows[:10]))
 
-    # Guardamos huella de la primera
-    seen_fingerprints.add(fingerprint(all_rows))
+    seen_hashes.add(fingerprint(all_rows))
 
     while True:
-        start += page_size_real  # nos movemos por lo que realmente devuelve
+        start += page_size_real  # avanzamos por lo que realmente devuelve
 
         postdata = post_template
         postdata = replace_param(postdata, "start", str(start))
         postdata = replace_param(postdata, "length", str(requested_length))
-
         if draw is not None:
             draw += 1
             postdata = replace_param(postdata, "draw", str(draw))
@@ -266,21 +259,19 @@ async def fetch_all_centers(page, req_template, first_payload):
             break
 
         fp = fingerprint(rows)
-        if fp in seen_fingerprints:
-            # Evita loop infinito si el backend ignora start y siempre devuelve lo mismo
+        if fp in seen_hashes:
+            # backend ignora start y repite página -> param start no es el correcto
+            dump_text("pagination_loop_detected.txt", f"Loop detectado en start={start}. Revisa chosen_body_snippet.txt")
             break
-        seen_fingerprints.add(fp)
+        seen_hashes.add(fp)
 
         all_rows.extend(rows)
 
-        # Actualizar total si viene
         if total is None and isinstance(obj, dict):
             total = obj.get("recordsFiltered") or obj.get("recordsTotal")
 
-        # Ajustar tamaño real (si el server cambia)
         page_size_real = max(1, len(rows))
 
-        # Condición de fin por total
         if total is not None and len(all_rows) >= int(total):
             break
 
@@ -292,9 +283,6 @@ async def fetch_all_centers(page, req_template, first_payload):
 
 
 def parse_centers(rows):
-    """
-    Convierte filas del listado en (codigo, nombre, ficha_url).
-    """
     centers = []
     for row in rows:
         codigo = ""
@@ -307,7 +295,6 @@ def parse_centers(rows):
             codigo = re.sub(r"<[^>]+>", " ", raw0).strip()
             nombre = re.sub(r"<[^>]+>", " ", raw1).strip()
 
-            # href en código o en acciones
             href = re.search(r'href="([^"]+)"', raw0)
             if href:
                 ficha_url = urljoin(BASE, href.group(1))
@@ -323,33 +310,23 @@ def parse_centers(rows):
             if not ficha_url and codigo.isdigit():
                 ficha_url = f"{BASE}/registroestatalentidadesformacion/centro/{codigo}"
             centers.append((codigo, nombre, ficha_url))
-
     return centers
 
 
 async def extract_email_from_detail(context, codigo, ficha_url, sample_dump=False):
-    """
-    Abre la ficha como página real (ejecuta JS) y escanea:
-    - mailto:
-    - texto visible
-    - HTML
-    - TODAS las respuestas XHR/fetch (muchas veces el correo viene por JSON)
-    """
     emails = set()
     page = await context.new_page()
 
     async def on_response(resp):
         try:
-            rt = resp.request.resource_type
-            if rt not in ("xhr", "fetch"):
+            if resp.request.resource_type not in ("xhr", "fetch"):
                 return
             if resp.status != 200:
                 return
-            # Limitar tamaño para eficiencia
-            text = await resp.text()
-            if len(text) > 2_000_000:
+            txt = await resp.text()
+            if len(txt) > 2_000_000:
                 return
-            emails.update(extract_emails(text))
+            emails.update(extract_emails(txt))
         except Exception:
             pass
 
@@ -357,14 +334,13 @@ async def extract_email_from_detail(context, codigo, ficha_url, sample_dump=Fals
 
     try:
         await page.goto(ficha_url, wait_until="domcontentloaded", timeout=DETAIL_TIMEOUT_MS)
-        # Espera corta para que cargue XHR internos
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1400)
 
         # mailto
         try:
             links = page.locator("a[href^='mailto:']")
             cnt = await links.count()
-            for i in range(min(cnt, 30)):
+            for i in range(min(cnt, 50)):
                 href = (await links.nth(i).get_attribute("href")) or ""
                 href = href.replace("mailto:", "").split("?")[0].strip()
                 if EMAIL_RE.fullmatch(href):
@@ -372,7 +348,7 @@ async def extract_email_from_detail(context, codigo, ficha_url, sample_dump=Fals
         except Exception:
             pass
 
-        # texto visible + HTML
+        # texto + html
         try:
             emails.update(extract_emails(await page.inner_text("body")))
         except Exception:
@@ -384,13 +360,11 @@ async def extract_email_from_detail(context, codigo, ficha_url, sample_dump=Fals
 
         email = sorted(emails)[0] if emails else ""
 
-        # Dump de muestra si no saca email (para verificar estructura)
         if sample_dump and not email:
             await page.screenshot(path=str(DEBUG_DIR / f"no_email_{codigo}.png"), full_page=True)
             dump_text(f"no_email_{codigo}.html", await page.content())
 
         return email
-
     except Exception:
         return ""
     finally:
@@ -410,44 +384,34 @@ async def main():
         )
         page = await context.new_page()
 
-        # 1) Endpoint + primera página
         req_template, first_payload = await detect_list_endpoint_and_template(page)
 
-        # 2) Traer TODOS los centros (no solo 10)
         rows = await fetch_all_centers(page, req_template, first_payload)
         centers = parse_centers(rows)
 
         dump_text("centers_count.txt", str(len(centers)))
         dump_text("centers_preview.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centers[:200]]))
 
-        if len(centers) <= 10:
-            # Señal clara de que el backend está ignorando start o devolviendo siempre lo mismo
-            dump_text(
-                "warning.txt",
-                "Solo se detectaron <=10 centros. Revisa debug/requests.json, chosen_endpoint.txt y chosen_body_snippet.txt."
-            )
-
-        # 3) Emails en paralelo
         sem = asyncio.Semaphore(CONCURRENCY)
 
-        async def worker(i, codigo, nombre, ficha_url):
+        async def worker(i, c, n, u):
             async with sem:
-                # guarda 3 dumps de muestra si no hay email
                 sample = i in (0, 1, 2)
-                email = await extract_email_from_detail(context, codigo, ficha_url, sample_dump=sample)
-                return (codigo, nombre, email)
+                email = await extract_email_from_detail(context, c, u, sample_dump=sample)
+                return (c, n, email)
 
         tasks = [worker(i, c, n, u) for i, (c, n, u) in enumerate(centers)]
         results = []
-        for chunk_start in range(0, len(tasks), 100):
-            chunk = tasks[chunk_start:chunk_start + 100]
+
+        # chunks para no petar memoria
+        for start in range(0, len(tasks), 120):
+            chunk = tasks[start:start + 120]
             results.extend(await asyncio.gather(*chunk))
-            # pequeña pausa para no saturar
             await asyncio.sleep(0.2)
 
         await browser.close()
 
-    # 4) CSV Excel-friendly: ; + UTF-8 BOM
+    # CSV excel ES: ; + BOM
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["codigo", "nombre", "email"])
