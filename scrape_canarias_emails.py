@@ -11,10 +11,16 @@ URL = "https://registrosfp.educacion.gob.es/registroestatalentidadesformacion/bu
 BASE = "https://registrosfp.educacion.gob.es"
 OUT_CSV = "emails_centros_canarias.csv"
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-
 DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
+
+# Email normal
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+# Email ofuscado típico: "nombre (at) dominio (dot) com" / "arroba" / "[at]" etc.
+OBFUSCATED_RE = re.compile(
+    r"([a-zA-Z0-9._%+\-]+)\s*(?:\(|\[)?\s*(?:at|arroba)\s*(?:\)|\])?\s*([a-zA-Z0-9.\-]+)\s*(?:\(|\[)?\s*(?:dot|punto)\s*(?:\)|\])?\s*([a-zA-Z]{2,})",
+    re.IGNORECASE
+)
 
 
 def dump_text(name: str, content: str):
@@ -25,9 +31,48 @@ def dump_json(name: str, obj):
     (DEBUG_DIR / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def extract_first_email(text: str) -> str:
-    m = EMAIL_RE.search(text or "")
-    return m.group(0) if m else ""
+def extract_emails_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    found = set(m.group(0) for m in EMAIL_RE.finditer(text))
+
+    # ofuscados
+    for m in OBFUSCATED_RE.finditer(text):
+        found.add(f"{m.group(1)}@{m.group(2)}.{m.group(3)}")
+
+    return sorted(found)
+
+
+def extract_emails_from_page(page) -> list[str]:
+    # 1) mailto:
+    emails = set()
+    try:
+        links = page.locator("a[href^='mailto:']")
+        for i in range(min(links.count(), 20)):
+            href = links.nth(i).get_attribute("href") or ""
+            href = href.replace("mailto:", "").split("?")[0].strip()
+            if EMAIL_RE.fullmatch(href):
+                emails.add(href)
+    except Exception:
+        pass
+
+    # 2) texto visible
+    try:
+        visible = page.inner_text("body")
+        for e in extract_emails_from_text(visible):
+            emails.add(e)
+    except Exception:
+        pass
+
+    # 3) HTML completo (por si está oculto)
+    try:
+        html = page.content()
+        for e in extract_emails_from_text(html):
+            emails.add(e)
+    except Exception:
+        pass
+
+    return sorted(emails)
 
 
 def is_json_with_rows(obj) -> bool:
@@ -61,7 +106,6 @@ def replace_param(postdata: str, key: str, value: str) -> str:
 
 
 def try_click_search(page):
-    # Muchas páginas aplican filtros solo al pulsar botón
     candidates = [
         "button:has-text('Buscar')",
         "button:has-text('Filtrar')",
@@ -112,30 +156,27 @@ def main():
 
         page.on("request", on_request)
 
-        # 1) Cargar
+        # --- abrir buscador y filtrar canarias ---
         page.goto(URL, wait_until="domcontentloaded", timeout=120000)
-
-        # 2) Filtrar
         page.get_by_label("Comunidad Autónoma").wait_for(timeout=120000)
         page.get_by_label("Comunidad Autónoma").select_option(label="ISLAS CANARIAS")
         page.wait_for_timeout(800)
+        try_click_search(page)
 
-        # 3) Forzar búsqueda si existe botón
-        clicked = try_click_search(page)
-        dump_text("clicked_search.txt", f"clicked={clicked}")
-
-        # 4) Esperar que JS lance requests
+        # esperar requests
         page.wait_for_timeout(1500)
         t0 = time.time()
-        while (time.time() - t0) < 20:
+        while (time.time() - t0) < 15:
             page.wait_for_timeout(500)
 
-        # Debug “qué ve el runner”
         page.screenshot(path=str(DEBUG_DIR / "after_filter.png"), full_page=True)
         dump_text("after_filter.html", page.content())
         dump_json("requests.json", captured_requests)
 
-        # 5) Autodetección de endpoint probando con page.request (mismo contexto)
+        if not captured_requests:
+            raise RuntimeError("No se capturaron requests del listado (ver debug/after_filter.*).")
+
+        # --- detectar endpoint JSON con page.request ---
         def score(req):
             u = req["url"].lower()
             s = 0
@@ -157,9 +198,8 @@ def main():
         tested = []
         chosen = None
         chosen_payload = None
-        chosen_body_snippet = None
 
-        for req in candidates[:120]:
+        for req in candidates[:150]:
             try:
                 fetch_kwargs = {
                     "method": req["method"],
@@ -182,7 +222,6 @@ def main():
                 if resp.status != 200:
                     continue
 
-                # Intentar JSON aunque el content-type sea raro
                 try:
                     obj = json.loads(body)
                 except Exception:
@@ -191,26 +230,18 @@ def main():
                 if is_json_with_rows(obj):
                     chosen = req
                     chosen_payload = obj
-                    chosen_body_snippet = body[:1500]
                     break
-
             except Exception:
                 continue
 
         dump_json("tested_candidates.json", tested)
 
         if not chosen:
-            # Guardar algunas pistas: primeras respuestas 200 (snippet)
-            dump_text("hint.txt", "No endpoint JSON detectado. Mira requests.json + tested_candidates.json + after_filter.png/html")
-            browser.close()
-            raise RuntimeError(
-                "No pude identificar endpoint JSON. Abre el artifact debug-dumps y mira requests.json / tested_candidates.json."
-            )
+            raise RuntimeError("No pude detectar endpoint JSON del listado. Revisa debug/requests.json.")
 
         dump_text("chosen_endpoint.txt", chosen["url"])
-        dump_text("chosen_body_snippet.txt", chosen_body_snippet or "")
 
-        # 6) Obtener filas (paginación si DataTables)
+        # --- paginar listado para sacar TODOS los centros ---
         all_rows = extract_rows(chosen_payload)
         post_template = chosen.get("post_data", "") or ""
         is_dt = any(k in post_template for k in ["start=", "length=", "draw="])
@@ -256,7 +287,7 @@ def main():
 
                 time.sleep(0.15)
 
-        # 7) Parsear centros
+        # --- parse centros: codigo + nombre y URL ficha (si no hay, se construye) ---
         centros = []
         for row in all_rows:
             codigo = ""
@@ -269,61 +300,68 @@ def main():
                 codigo = re.sub(r"<[^>]+>", " ", raw0).strip()
                 nombre = re.sub(r"<[^>]+>", " ", raw1).strip()
 
+                # buscar href en acciones/código
                 href = re.search(r'href="([^"]+)"', raw0)
                 if href:
                     ficha_url = urljoin(BASE, href.group(1))
-
                 if not ficha_url:
                     href2 = re.search(r'href="([^"]+)"', str(row[-1]))
                     if href2:
                         ficha_url = urljoin(BASE, href2.group(1))
-
-            elif isinstance(row, dict):
-                for k in ["codigo", "codigoCentro", "codCentro", "code"]:
-                    if k in row:
-                        codigo = str(row[k]).strip()
-                        break
-                for k in ["nombre", "nombreCentro", "denominacion", "name"]:
-                    if k in row:
-                        nombre = str(row[k]).strip()
-                        break
-                for k in ["url", "detalle", "detailUrl", "fichaUrl"]:
-                    if k in row:
-                        ficha_url = urljoin(BASE, str(row[k]))
-                        break
 
             codigo = re.sub(r"\s+", " ", codigo).strip()
             nombre = re.sub(r"\s+", " ", nombre).strip()
 
             if codigo and nombre:
                 if not ficha_url and codigo.isdigit():
+                    # URL estándar, pero OJO: puede que la ficha pública sea otra.
                     ficha_url = f"{BASE}/registroestatalentidadesformacion/centro/{codigo}"
                 centros.append((codigo, nombre, ficha_url))
 
         dump_text("centros_count.txt", str(len(centros)))
-        dump_text("centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:400]]))
+        dump_text("centros_detectados.txt", "\n".join([f"{c} | {n} | {u}" for c, n, u in centros[:300]]))
 
-        # 8) Extraer email en fichas
+        # --- abrir fichas EN NAVEGADOR y extraer email ---
+        # Importante: así se ejecuta el JS de la ficha si carga el email dinámicamente.
         out = []
-        for codigo, nombre, ficha_url in centros:
+        failed_samples = 0
+
+        for idx, (codigo, nombre, ficha_url) in enumerate(centros, start=1):
             email = ""
-            if ficha_url:
-                try:
-                    resp = page.request.get(
-                        ficha_url,
-                        headers={"referer": URL, "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-                        timeout=60000,
-                    )
-                    if resp.status == 200:
-                        email = extract_first_email(resp.text())
-                except Exception:
-                    email = ""
+
+            # Abrimos ficha en una pestaña aparte para no romper el listado
+            detail = context.new_page()
+            try:
+                detail.goto(ficha_url, wait_until="domcontentloaded", timeout=120000)
+                # esperar un poco a JS
+                detail.wait_for_timeout(1200)
+
+                emails = extract_emails_from_page(detail)
+                if emails:
+                    email = emails[0]  # si hay varios, nos quedamos con el primero
+
+                # si no hay email, guardamos muestra de 3 fichas para ver estructura
+                if not email and failed_samples < 3:
+                    detail.screenshot(path=str(DEBUG_DIR / f"no_email_{failed_samples+1}_{codigo}.png"), full_page=True)
+                    dump_text(f"no_email_{failed_samples+1}_{codigo}.html", detail.content())
+                    failed_samples += 1
+
+            except Exception:
+                # si falla la ficha, dejamos vacío
+                pass
+            finally:
+                detail.close()
+
             out.append([codigo, nombre, email])
+            # rate limit suave
             time.sleep(0.12)
+
+            if idx % 50 == 0:
+                print(f"Procesados {idx}/{len(centros)}...")
 
         browser.close()
 
-    # 9) CSV “Excel friendly”: ; y UTF-8 con BOM
+    # CSV “Excel friendly”: ; + BOM
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["codigo", "nombre", "email"])
